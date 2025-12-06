@@ -79,6 +79,56 @@ __all__ = ['VisionTransformer']  # model_registry will add each entrypoint fn to
 _logger = logging.getLogger(__name__)
 
 
+
+# JQ
+import numpy as np
+def get_ortho_like(dim, heads, alpha, beta, sign=1, dist='uniform'):
+        if dist == 'normal':
+            A = alpha * np.random.normal(size=(dim,dim)) / (dim**0.5) + sign * beta * np.eye(dim)
+        if dist == 'uniform':
+            A = alpha * np.random.uniform(size=(dim,dim), low=-3**0.5 / (dim**0.5), high = 3**0.5 / (dim**0.5))\
+        + sign * beta * np.eye(dim)
+
+        U, S, V = np.linalg.svd(A)
+        L = U @ np.diag(np.sqrt(S))
+        R = np.diag(np.sqrt(S)) @ V
+        return L, R
+
+
+# JQ
+def impulse_init(heads,img_size,att_rank,kernel_size=3,spatial_pe=None,scale=1000.0):
+    weight = torch.zeros((heads,img_size[0]*img_size[1],img_size[0]*img_size[1]))
+    k = [4,1,5,3,7,0,2,6,8]
+    for i in range(heads):
+        m = (k[i%(kernel_size**2)]//kernel_size)-(kernel_size//2)
+        n = (k[i%(kernel_size**2)]%kernel_size)-(kernel_size//2)
+        tmp_weight = torch.zeros((img_size[1],img_size[1]))
+        for j in range(0-min(0,n),img_size[1]-max(0,n)):
+            tmp_weight[j,j+n] = 1
+        for j in range(0-min(0,m),img_size[0]-max(0,m)):
+            weight[i,j*img_size[1]:(j+1)*img_size[1],(j+m)*img_size[1]:(j+m+1)*img_size[1]] += tmp_weight
+    tmp = torch.rand_like(weight)
+    trunc_normal_(tmp,std=0.6)
+    weight = scale*(weight) + 3.0*(tmp-0.0)*(weight==0)
+
+    pe = torch.nn.functional.layer_norm(spatial_pe,[spatial_pe.shape[-1]])
+    ptp = torch.matmul(pe.transpose(-1,-2),pe)
+    u,s,v = torch.svd(ptp)
+    s_inv = torch.zeros_like(s)
+    s_inv[:att_rank] = 1/s[:att_rank]
+    ptp_inv = torch.matmul(torch.matmul(v,torch.diag_embed(s_inv)),u.transpose(-1,-2))
+    pe_inv = torch.matmul(ptp_inv,pe.transpose(-1,-2))
+    A = torch.matmul(torch.matmul(pe_inv,weight),pe_inv.transpose(-1,-2))
+    u,s,v = torch.svd(A)
+    s = torch.diag_embed(s[:,:att_rank].sqrt())
+    u_lr = (u[:,:,:att_rank]@s)
+    vt_lr = (v[:,:,:att_rank]@s).transpose(-1,-2)
+    u_lr = u_lr/u_lr.norm('fro',dim=(-1,-2),keepdim=True)
+    vt_lr = vt_lr/vt_lr.norm('fro',dim=(-1,-2),keepdim=True)
+    return u_lr.numpy(), vt_lr.numpy()
+
+
+
 class Block(nn.Module):
     """Transformer block with pre-normalization."""
 
@@ -475,6 +525,7 @@ class VisionTransformer(nn.Module):
             attn_drop_rate: float = 0.,
             drop_path_rate: float = 0.,
             weight_init: Literal['skip', 'jax', 'jax_nlhb', 'moco', ''] = '',
+            post_weight_init: Literal['default', 'mimetic', 'impulse'] = 'default', # JQ
             fix_init: bool = False,
             embed_layer: Callable = PatchEmbed,
             embed_norm_layer: Optional[LayerType] = None,
@@ -619,6 +670,81 @@ class VisionTransformer(nn.Module):
             self.init_weights(weight_init)
         if fix_init:
             self.fix_init_weight()
+
+
+        
+        # JQ
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+        self.depth = depth
+        self.attn_size = [(img_size//patch_size),(img_size//patch_size)]
+        self.post_init_weights(post_weight_init)
+
+
+    # JQ: add post initialization
+    def post_init_weights(self, mode: str = '') -> None:
+        if mode[:7] == 'default': # JQ: default init but match the norm to mimetic
+            norm_p, norm_q, norm_v = 1.0, 1.0, 1.0
+            if len(mode) > 7:
+                a, b, c = mode[7:].split('_')
+                norm_p = float(a)
+                norm_q = float(b)#/math.sqrt(self.embed_dim/192)
+                norm_v = float(c)#/math.sqrt(self.embed_dim/192)
+            self.pos_embed.data = norm_p * self.pos_embed.data
+            for i in range(self.depth):
+                self.blocks[i].attn.qkv.weight.data[:self.embed_dim*2] = norm_q * self.blocks[i].attn.qkv.weight.data[:self.embed_dim*2].detach()
+                self.blocks[i].attn.qkv.weight.data[self.embed_dim*2:] = norm_v * self.blocks[i].attn.qkv.weight.data[self.embed_dim*2:].detach()
+                self.blocks[i].attn.proj.weight.data = norm_v * self.blocks[i].attn.proj.weight.data.detach()
+        elif mode[:7] == 'mimetic': # JQ: mimetic init
+            norm_p, norm_q, norm_v = 1.0, 1.0, 1.0
+            if len(mode) > 7:
+                a, b, c = mode[7:].split('_')
+                norm_p = float(a)
+                norm_q = float(b)
+                norm_v = float(c)
+            head_dim = self.embed_dim // self.num_heads
+            self.pos_embed.data = norm_p * self.pos_embed.data
+            for i in range(self.depth):
+                for h in range(self.num_heads):
+                    Q, K = get_ortho_like(self.embed_dim, -float('inf'), 0.7, 0.7, 1)
+                    Q = Q[:,:head_dim]
+                    K = K.T[:,:head_dim]
+                    self.blocks[i].attn.qkv.weight.data[(h*head_dim):((h+1)*head_dim)] = norm_q * torch.tensor(Q.T).float()
+                    self.blocks[i].attn.qkv.weight.data[self.embed_dim+(h*head_dim):self.embed_dim+((h+1)*head_dim)] = norm_q * torch.tensor(K.T).float()
+                V, Proj = get_ortho_like(self.embed_dim, self.num_heads, 0.4, 0.4, -1)
+                self.blocks[i].attn.qkv.weight.data[self.embed_dim*2:] = norm_v * torch.tensor(V).float()
+                self.blocks[i].attn.proj.weight.data = norm_v * torch.tensor(Proj).float()
+        elif mode[:7] == 'impulse': # JQ: impulse init
+            norm_p, norm_q, norm_v = 18.0, 7.0, 1.0
+            if len(mode) > 7:
+                a, b, c = mode[7:].split('_')
+                norm_p = float(a)
+                norm_q = float(b)
+                norm_v = float(c)
+            head_dim = self.embed_dim // self.num_heads
+            self.pos_embed.data = self.pos_embed.data * norm_p
+            if self.no_embed_class:
+                pe = self.pos_embed.squeeze().detach().cpu()
+            else:
+                pe = self.pos_embed.squeeze().detach().cpu()[1:]
+            for i in range(self.depth):
+                Q, K = impulse_init(self.num_heads,self.attn_size,head_dim,spatial_pe=pe)
+                for h in range(self.num_heads):
+                    self.blocks[i].attn.qkv.weight.data[(h*head_dim):((h+1)*head_dim)] = norm_q * torch.tensor(Q[h].T).float()
+                    self.blocks[i].attn.qkv.weight.data[self.embed_dim+(h*head_dim):self.embed_dim+((h+1)*head_dim)] = norm_q * torch.tensor(K[h]).float()
+                V, Proj = get_ortho_like(self.embed_dim, self.num_heads, 0.4, 0.4, -1)
+                self.blocks[i].attn.qkv.weight.data[self.embed_dim*2:] = norm_v * torch.tensor(V.T).float()
+                self.blocks[i].attn.proj.weight.data = norm_v * torch.tensor(Proj.T).float()
+
+
+
+
+
+
+
+
+
+
 
     def fix_init_weight(self) -> None:
         """Apply weight initialization fix (scaling w/ layer index)."""
